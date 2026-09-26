@@ -2,6 +2,10 @@ import { Resend } from "resend";
 import { z } from "zod/v4";
 
 import {
+  createProposalAccessToken,
+} from "@/lib/proposal-access";
+
+import {
   supabaseAdmin,
   SUPABASE_STORAGE_BUCKET,
 } from "@/lib/supabase-admin";
@@ -168,6 +172,10 @@ export async function POST(
     const airtableTableId =
       process.env
         .AIRTABLE_TABLE_ID;
+
+    const proposalLinkSecret =
+      process.env
+        .PROPOSAL_LINK_SECRET;
 
     if (!resendApiKey) {
       console.error(
@@ -588,6 +596,39 @@ export async function POST(
       );
     }
 
+    let secureProposalUrl =
+      "";
+
+    if (proposalLinkSecret) {
+      const token =
+        createProposalAccessToken(
+          lead.lead_id,
+          proposalLinkSecret
+        );
+
+      const accessUrl =
+        new URL(
+          `/api/proposals/access/${encodeURIComponent(
+            lead.lead_id
+          )}`,
+          new URL(
+            request.url
+          ).origin
+        );
+
+      accessUrl.searchParams.set(
+        "token",
+        token
+      );
+
+      secureProposalUrl =
+        accessUrl.toString();
+    } else {
+      console.error(
+        "PROPOSAL_LINK_SECRET is not configured. Airtable Secure Proposal link will be blank."
+      );
+    }
+
     /*
      * Airtable is an operational mirror for the
      * contractor, not the system of record.
@@ -616,7 +657,8 @@ export async function POST(
 
             tableId:
               airtableTableId,
-          }
+          },
+          secureProposalUrl
         );
 
       airtableSynced =
@@ -785,7 +827,8 @@ type AirtableSyncResult =
 
 async function syncLeadToAirtable(
   lead: LeadRecord,
-  config: AirtableConfig
+  config: AirtableConfig,
+  secureProposalUrl: string
 ): Promise<AirtableSyncResult> {
   try {
     const tableUrl =
@@ -854,7 +897,8 @@ async function syncLeadToAirtable(
 
     const fields =
       buildAirtableFields(
-        lead
+        lead,
+        secureProposalUrl
       );
 
     if (existingRecord?.id) {
@@ -1005,7 +1049,8 @@ async function syncLeadToAirtable(
 }
 
 function buildAirtableFields(
-  lead: LeadRecord
+  lead: LeadRecord,
+  secureProposalUrl: string
 ) {
   const overview =
     asRecord(
@@ -1091,6 +1136,9 @@ function buildAirtableFields(
       buildAirtableClarifications(
         overview
       ),
+
+    "Secure Proposal":
+      secureProposalUrl,
   };
 }
 
