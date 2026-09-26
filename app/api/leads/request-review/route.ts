@@ -157,6 +157,18 @@ export async function POST(
       process.env
         .CONTRACTOR_NOTIFICATION_EMAIL;
 
+    const airtableAccessToken =
+      process.env
+        .AIRTABLE_ACCESS_TOKEN;
+
+    const airtableBaseId =
+      process.env
+        .AIRTABLE_BASE_ID;
+
+    const airtableTableId =
+      process.env
+        .AIRTABLE_TABLE_ID;
+
     if (!resendApiKey) {
       console.error(
         "RESEND_API_KEY is not configured."
@@ -576,6 +588,152 @@ export async function POST(
       );
     }
 
+    /*
+     * Airtable is an operational mirror for the
+     * contractor, not the system of record.
+     *
+     * A sync problem must never undo or invalidate
+     * an already-saved homeowner request or an email
+     * notification that was successfully sent.
+     */
+    let airtableSynced =
+      false;
+
+    if (
+      airtableAccessToken &&
+      airtableBaseId &&
+      airtableTableId
+    ) {
+      const airtableResult =
+        await syncLeadToAirtable(
+          lead,
+          {
+            accessToken:
+              airtableAccessToken,
+
+            baseId:
+              airtableBaseId,
+
+            tableId:
+              airtableTableId,
+          }
+        );
+
+      airtableSynced =
+        airtableResult.ok;
+
+      if (airtableResult.ok) {
+        const syncedAt =
+          new Date().toISOString();
+
+        const {
+          error:
+            airtableAuditError,
+        } =
+          await supabaseAdmin
+            .from(LEADS_TABLE)
+            .update({
+              airtable_record_id:
+                airtableResult.recordId,
+
+              airtable_synced_at:
+                syncedAt,
+
+              airtable_sync_error:
+                null,
+
+              updated_at:
+                syncedAt,
+            })
+            .eq(
+              "lead_id",
+              lead.lead_id
+            )
+            .eq(
+              "tenant_id",
+              TENANT_ID
+            );
+
+        if (airtableAuditError) {
+          console.error(
+            "Airtable sync audit update failed:",
+            airtableAuditError
+          );
+        }
+      } else {
+        console.error(
+          "Airtable lead sync failed:",
+          airtableResult.error
+        );
+
+        const {
+          error:
+            airtableErrorAuditError,
+        } =
+          await supabaseAdmin
+            .from(LEADS_TABLE)
+            .update({
+              airtable_sync_error:
+                airtableResult.error,
+
+              updated_at:
+                new Date().toISOString(),
+            })
+            .eq(
+              "lead_id",
+              lead.lead_id
+            )
+            .eq(
+              "tenant_id",
+              TENANT_ID
+            );
+
+        if (
+          airtableErrorAuditError
+        ) {
+          console.error(
+            "Airtable sync error audit update failed:",
+            airtableErrorAuditError
+          );
+        }
+      }
+    } else {
+      console.error(
+        "Airtable environment variables are not fully configured."
+      );
+
+      const {
+        error:
+          airtableConfigAuditError,
+      } =
+        await supabaseAdmin
+          .from(LEADS_TABLE)
+          .update({
+            airtable_sync_error:
+              "Airtable environment variables are not fully configured.",
+
+            updated_at:
+              new Date().toISOString(),
+          })
+          .eq(
+            "lead_id",
+            lead.lead_id
+          )
+          .eq(
+            "tenant_id",
+            TENANT_ID
+          );
+
+      if (
+        airtableConfigAuditError
+      ) {
+        console.error(
+          "Airtable configuration audit update failed:",
+          airtableConfigAuditError
+        );
+      }
+    }
+
     return Response.json({
       ok: true,
 
@@ -587,6 +745,8 @@ export async function POST(
 
       contractorNotified:
         true,
+
+      airtableSynced,
     });
   } catch (error) {
     console.error(
@@ -605,6 +765,654 @@ export async function POST(
       }
     );
   }
+}
+
+type AirtableConfig = {
+  accessToken: string;
+  baseId: string;
+  tableId: string;
+};
+
+type AirtableSyncResult =
+  | {
+      ok: true;
+      recordId: string;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+
+async function syncLeadToAirtable(
+  lead: LeadRecord,
+  config: AirtableConfig
+): Promise<AirtableSyncResult> {
+  try {
+    const tableUrl =
+      `https://api.airtable.com/v0/${config.baseId}/${config.tableId}`;
+
+    /*
+     * Look for an existing row first.
+     *
+     * If it already exists, we update only fields
+     * owned by the Second Opinion Engine. We do NOT
+     * overwrite Lead Status or Internal Notes because
+     * those belong to the contractor.
+     */
+    const formula =
+      `{Lead Reference}='${lead.lead_id}'`;
+
+    const lookupUrl =
+      new URL(
+        tableUrl
+      );
+
+    lookupUrl.searchParams.set(
+      "maxRecords",
+      "1"
+    );
+
+    lookupUrl.searchParams.set(
+      "filterByFormula",
+      formula
+    );
+
+    const lookupResponse =
+      await fetch(
+        lookupUrl.toString(),
+        {
+          method: "GET",
+
+          headers: {
+            Authorization:
+              `Bearer ${config.accessToken}`,
+          },
+        }
+      );
+
+    const lookupData =
+      await lookupResponse.json();
+
+    if (!lookupResponse.ok) {
+      return {
+        ok: false,
+
+        error:
+          airtableErrorMessage(
+            lookupData,
+            "Unable to check Airtable for an existing lead."
+          ),
+      };
+    }
+
+    const existingRecord =
+      Array.isArray(
+        lookupData.records
+      )
+        ? lookupData.records[0]
+        : null;
+
+    const fields =
+      buildAirtableFields(
+        lead
+      );
+
+    if (existingRecord?.id) {
+      const updateResponse =
+        await fetch(
+          tableUrl,
+          {
+            method: "PATCH",
+
+            headers: {
+              Authorization:
+                `Bearer ${config.accessToken}`,
+
+              "Content-Type":
+                "application/json",
+            },
+
+            body: JSON.stringify({
+              records: [
+                {
+                  id:
+                    existingRecord.id,
+
+                  fields,
+                },
+              ],
+
+              typecast:
+                true,
+            }),
+          }
+        );
+
+      const updateData =
+        await updateResponse.json();
+
+      if (!updateResponse.ok) {
+        return {
+          ok: false,
+
+          error:
+            airtableErrorMessage(
+              updateData,
+              "Unable to update the Airtable lead."
+            ),
+        };
+      }
+
+      const updatedRecord =
+        Array.isArray(
+          updateData.records
+        )
+          ? updateData.records[0]
+          : null;
+
+      return {
+        ok: true,
+
+        recordId:
+          updatedRecord?.id ||
+          existingRecord.id,
+      };
+    }
+
+    /*
+     * New lead: create the row and initialize the
+     * contractor-owned status to New.
+     */
+    const createResponse =
+      await fetch(
+        tableUrl,
+        {
+          method: "POST",
+
+          headers: {
+            Authorization:
+              `Bearer ${config.accessToken}`,
+
+            "Content-Type":
+              "application/json",
+          },
+
+          body: JSON.stringify({
+            records: [
+              {
+                fields: {
+                  ...fields,
+
+                  "Lead Status":
+                    "New",
+                },
+              },
+            ],
+
+            typecast:
+              true,
+          }),
+        }
+      );
+
+    const createData =
+      await createResponse.json();
+
+    if (!createResponse.ok) {
+      return {
+        ok: false,
+
+        error:
+          airtableErrorMessage(
+            createData,
+            "Unable to create the Airtable lead."
+          ),
+      };
+    }
+
+    const createdRecord =
+      Array.isArray(
+        createData.records
+      )
+        ? createData.records[0]
+        : null;
+
+    if (!createdRecord?.id) {
+      return {
+        ok: false,
+
+        error:
+          "Airtable created the lead but returned no record ID.",
+      };
+    }
+
+    return {
+      ok: true,
+
+      recordId:
+        createdRecord.id,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : "Unknown Airtable sync error.",
+    };
+  }
+}
+
+function buildAirtableFields(
+  lead: LeadRecord
+) {
+  const overview =
+    asRecord(
+      lead.homeowner_overview
+    );
+
+  const proposal =
+    asRecord(
+      overview?.proposal
+    );
+
+  const headline =
+    asRecord(
+      overview?.headline
+    );
+
+  return {
+    "Lead Reference":
+      lead.lead_id,
+
+    "Received At":
+      lead.consented_at ||
+      new Date().toISOString(),
+
+    "First Name":
+      lead.first_name ||
+      "",
+
+    "Last Name":
+      lead.last_name ||
+      "",
+
+    Email:
+      lead.email ||
+      "",
+
+    Phone:
+      lead.phone ||
+      "",
+
+    ZIP:
+      lead.zip_code ||
+      "",
+
+    Timeline:
+      lead.timeline ||
+      "",
+
+    Concern:
+      lead.concern ||
+      "",
+
+    "Homeowner Message":
+      lead.homeowner_message ||
+      "",
+
+    "Original Contractor":
+      displayAirtableValue(
+        proposal?.contractorName
+      ),
+
+    "Proposal Number":
+      displayAirtableValue(
+        proposal?.proposalNumber
+      ),
+
+    "Proposal Price":
+      displayAirtableValue(
+        headline?.price
+      ),
+
+    "Proposal Summary":
+      buildAirtableProposalSummary(
+        overview
+      ),
+
+    "Explicit Exclusions":
+      buildAirtableExclusions(
+        overview
+      ),
+
+    "Worth Clarifying":
+      buildAirtableClarifications(
+        overview
+      ),
+  };
+}
+
+function buildAirtableProposalSummary(
+  overview:
+    | Record<string, unknown>
+    | null
+) {
+  if (!overview) {
+    return "Automated Quote Overview unavailable. Review the original proposal directly.";
+  }
+
+  const lines: string[] = [];
+
+  const headline =
+    asRecord(
+      overview.headline
+    );
+
+  const headlineTitle =
+    optionalString(
+      headline?.title
+    );
+
+  if (headlineTitle) {
+    lines.push(
+      headlineTitle
+    );
+  }
+
+  const options =
+    asRecordArray(
+      overview.options
+    );
+
+  for (
+    const option of options
+  ) {
+    const optionParts:
+      string[] = [];
+
+    const label =
+      optionalString(
+        option.label
+      );
+
+    const price =
+      optionalString(
+        asRecord(
+          option.price
+        )?.value
+      );
+
+    const efficiencies =
+      asRecordArray(
+        option.efficiency
+      )
+        .map(
+          (item) =>
+            optionalString(
+              item.value
+            )
+        )
+        .filter(
+          (
+            value
+          ): value is string =>
+            Boolean(value)
+        );
+
+    const equipment =
+      asRecordArray(
+        option.equipment
+      )
+        .map(
+          (item) => {
+            const name =
+              optionalString(
+                item.name
+              );
+
+            const details =
+              Array.isArray(
+                item.details
+              )
+                ? item.details
+                    .filter(
+                      (
+                        detail
+                      ): detail is string =>
+                        typeof detail ===
+                          "string" &&
+                        detail.trim()
+                          .length > 0
+                    )
+                : [];
+
+            if (!name) {
+              return null;
+            }
+
+            return details.length > 0
+              ? `${name} (${details.join(", ")})`
+              : name;
+          }
+        )
+        .filter(
+          (
+            value
+          ): value is string =>
+            Boolean(value)
+        );
+
+    if (label) {
+      optionParts.push(
+        label
+      );
+    }
+
+    if (price) {
+      optionParts.push(
+        price
+      );
+    }
+
+    if (
+      efficiencies.length > 0
+    ) {
+      optionParts.push(
+        efficiencies.join(", ")
+      );
+    }
+
+    if (
+      equipment.length > 0
+    ) {
+      optionParts.push(
+        equipment.join("; ")
+      );
+    }
+
+    if (
+      optionParts.length > 0
+    ) {
+      lines.push(
+        optionParts.join(
+          " — "
+        )
+      );
+    }
+  }
+
+  return (
+    lines.join("\n") ||
+    "Proposal details are available in the stored Quote Overview."
+  );
+}
+
+function buildAirtableExclusions(
+  overview:
+    | Record<string, unknown>
+    | null
+) {
+  const exclusions =
+    asRecordArray(
+      overview?.exclusions
+    );
+
+  if (
+    exclusions.length === 0
+  ) {
+    return "";
+  }
+
+  return exclusions
+    .map((item) => {
+      const label =
+        optionalString(
+          item.label
+        );
+
+      const text =
+        optionalString(
+          item.text
+        );
+
+      if (
+        label &&
+        text
+      ) {
+        return `${label}: ${text}`;
+      }
+
+      return (
+        text ||
+        label ||
+        null
+      );
+    })
+    .filter(
+      (
+        value
+      ): value is string =>
+        Boolean(value)
+    )
+    .join("\n");
+}
+
+function buildAirtableClarifications(
+  overview:
+    | Record<string, unknown>
+    | null
+) {
+  const clarifications =
+    asRecordArray(
+      overview?.clarifications
+    );
+
+  if (
+    clarifications.length === 0
+  ) {
+    return "";
+  }
+
+  return clarifications
+    .map((item) => {
+      const label =
+        optionalString(
+          item.label
+        );
+
+      const message =
+        optionalString(
+          item.message
+        );
+
+      if (
+        label &&
+        message
+      ) {
+        return `${label}: ${message}`;
+      }
+
+      return (
+        message ||
+        label ||
+        null
+      );
+    })
+    .filter(
+      (
+        value
+      ): value is string =>
+        Boolean(value)
+    )
+    .join("\n");
+}
+
+function displayAirtableValue(
+  value: unknown
+) {
+  return (
+    optionalString(
+      value
+    ) || ""
+  );
+}
+
+function optionalString(
+  value: unknown
+) {
+  if (
+    typeof value ===
+      "string"
+  ) {
+    const trimmed =
+      value.trim();
+
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+
+  return null;
+}
+
+function airtableErrorMessage(
+  data: unknown,
+  fallback: string
+) {
+  const record =
+    asRecord(
+      data
+    );
+
+  const error =
+    asRecord(
+      record?.error
+    );
+
+  const message =
+    optionalString(
+      error?.message
+    );
+
+  const type =
+    optionalString(
+      error?.type
+    );
+
+  if (
+    type &&
+    message
+  ) {
+    return `${type}: ${message}`;
+  }
+
+  return (
+    message ||
+    type ||
+    fallback
+  );
 }
 
 function buildContractorEmail(
