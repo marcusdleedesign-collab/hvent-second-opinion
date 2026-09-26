@@ -1133,10 +1133,14 @@ function Disclosure() {
   return (
     <div className="mt-6 rounded-xl bg-white/5 p-4">
       <p className="text-sm leading-6 text-slate-400">
-        Your proposal will be processed
-        automatically to create your Quote Overview.
-        The automated overview is not a professional
-        HVAC opinion.
+        Your proposal is uploaded to private storage
+        and processed automatically to create your
+        Quote Overview. It is not publicly accessible.
+        If you choose to request a professional second
+        opinion, your proposal and contact information
+        will be shared with HVent for that review. The
+        automated overview is not a professional HVAC
+        opinion.
       </p>
     </div>
   );
