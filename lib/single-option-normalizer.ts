@@ -466,8 +466,8 @@ function mergePriceBreakdown(
       ),
 
       normalizeText(
-        item.amount
-      ),
+  item.amount ?? ""
+),
 
       String(
         item.page ?? ""
